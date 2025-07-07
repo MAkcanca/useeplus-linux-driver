@@ -61,13 +61,15 @@ struct camera_dev {
     unsigned char *urb_buffer;
     
     // Frame ring buffer
-    void *framebuffer;
+    struct camera_frame_header *framebuffer;
     struct camera_frame_header *framebuffer_limit;
-    struct camera_frame_header *current_frame;
-    struct camera_frame_header *read_frame;
     
+    // Write position
+    struct camera_frame_header *current_frame;
     size_t packet_count;
-
+    size_t images_received;
+    size_t max_lag;
+    
     // Character device
     struct cdev cdev;
     dev_t dev_num;
@@ -77,6 +79,8 @@ struct camera_dev {
     bool device_open;
     
     // Read position
+    struct camera_frame_header *read_frame;
+    size_t images_read;
     size_t read_pos;
     
     // State
@@ -156,10 +160,14 @@ static void process_data(struct camera_dev *dev, unsigned char *data, int length
                 init_frame(frame, header->index);
                 framedata = (unsigned char*) (frame + 1);
                 dev->current_frame = frame;
+                dev->images_received++;
+                if (!dev->max_lag && dev->current_frame == dev->framebuffer) {
+                    dev->max_lag = dev->images_received / 2;
+                    printk(KERN_INFO "Camera: Max. client lag is %zu frames", dev->max_lag);
+                }
                 wake_up_interruptible(&dev->read_wait);
             } else {
-                printk(KERN_WARNING "Camera: Image %u is corrupt, skipping",
-                        frame->index);
+                printk(KERN_WARNING "Camera: Image %u is corrupt, skipping", frame->index);
                 init_frame(frame, header->index);
             }
         }
@@ -171,8 +179,7 @@ static void process_data(struct camera_dev *dev, unsigned char *data, int length
             memcpy(framedata + frame->length, data + IMAGE_HEADER_SIZE, payload_length);
             frame->length += payload_length;
         } else {
-            printk(KERN_WARNING "Camera: Image %u exceeds buffer size",
-                     frame->index);
+            printk(KERN_WARNING "Camera: Image %u exceeds buffer size", frame->index);
         }
     }
 }
@@ -276,6 +283,9 @@ static int start_streaming(struct camera_dev *dev)
     }
     
     dev->packet_count = 0;
+    dev->images_received = 0;
+    dev->images_read = 0;
+    dev->max_lag = 0;
     dev->streaming = true;
     return 0;
 
@@ -330,6 +340,7 @@ static int camera_open(struct inode *inode, struct file *file)
     dev->device_open = true;
     dev->read_pos = 0;
     dev->read_frame = dev->current_frame;
+    dev->images_read = dev->images_received;
     
     mutex_unlock(&dev->io_mutex);
     
@@ -358,17 +369,36 @@ static ssize_t camera_read(struct file *file, char __user *buf, size_t count, lo
         return -ERESTARTSYS;
     }
     
-    // Find ready frame
-    struct camera_frame_header *frame = check_frame(dev->read_frame);
-    if (!frame) {
-        printk(KERN_ERR "Camera: Invalid frame buffer (reading too slowly?)");
-        dev->read_frame = dev->current_frame;
-        dev->read_pos = 0;
+    if (!dev->max_lag) {
+        printk(KERN_INFO "Camera: Waiting for max_lag calculation");
+
+        // No ready frames - wait or return
+        mutex_unlock(&dev->io_mutex);
+
+        if (file->f_flags & O_NONBLOCK) {
+            return -EAGAIN;
+        }
+
+        if (wait_event_interruptible(dev->read_wait, dev->max_lag)) {
+            return -ERESTARTSYS;
+        }
+
+        if (mutex_lock_interruptible(&dev->io_mutex)) {
+            return -ERESTARTSYS;
+        }
     }
 
+    // check for client lagging behind
+    if (dev->images_received - dev->images_read > dev->max_lag) {
+        printk(KERN_INFO "Camera: Client is too slow (%zu/%zu)), re-setting read_frame", dev->images_read, dev->images_received);
+        dev->read_frame = dev->current_frame;
+        dev->read_pos = 0;
+        dev->images_read = dev->images_received;
+    }
+
+    // Find ready frame
     while (dev->read_frame == dev->current_frame) {
         printk(KERN_INFO "Camera: No image available, waiting");
-        dev->read_pos = 0;
 
         // No ready frames - wait or return
         mutex_unlock(&dev->io_mutex);
@@ -387,7 +417,7 @@ static ssize_t camera_read(struct file *file, char __user *buf, size_t count, lo
         }
     }
     
-    frame = check_frame(dev->read_frame);
+    struct camera_frame_header *frame = check_frame(dev->read_frame);
     if (!frame) {
         printk(KERN_ERR "Camera: Invalid frame buffer! %p/%p/%p/%p",
                 dev->framebuffer, dev->read_frame, dev->current_frame, dev->framebuffer_limit);
@@ -395,16 +425,17 @@ static ssize_t camera_read(struct file *file, char __user *buf, size_t count, lo
         return -EIO;
     }
     
-    printk(KERN_INFO "Camera: Reading image %d from position %zu", frame->index, dev->read_pos);
-    
     // Calculate bytes to read
     bytes_read = min_t(size_t, count, frame->length - dev->read_pos);
+
+    printk(KERN_INFO "Camera: Reading image %d from position %zu, size %zd", frame->index, dev->read_pos, bytes_read);
 
     if (bytes_read <= 0) {
         // End of frame - move to next
         frame = next_frame(dev, frame);
         dev->read_frame = frame;
         dev->read_pos = 0;
+        dev->images_read++;
         mutex_unlock(&dev->io_mutex);
         return 0;
     }
@@ -423,6 +454,7 @@ static ssize_t camera_read(struct file *file, char __user *buf, size_t count, lo
         frame = next_frame(dev, frame);
         dev->read_frame = frame;
         dev->read_pos = 0;
+        dev->images_read++;
     }
 
     mutex_unlock(&dev->io_mutex);
@@ -467,7 +499,7 @@ static int camera_probe(struct usb_interface *interface, const struct usb_device
         printk(KERN_ERR "Camera: Failed to allocate frame buffer");
         goto error_alloc_frames;
     }
-    dev->framebuffer_limit = dev->framebuffer + FRAMEBUFFER_SIZE - BUFFER_SIZE;
+    dev->framebuffer_limit = (void *) dev->framebuffer + FRAMEBUFFER_SIZE - BUFFER_SIZE;
     dev->current_frame = dev->read_frame = dev->framebuffer;
     init_frame(dev->current_frame, 0);
 
