@@ -54,6 +54,8 @@ struct camera_frame_header {
 #define BUFFER_SIZE (64*1024)  // Buffer for USB transfers
 #define FRAMEBUFFER_SIZE (4*BUFFER_SIZE)    // Ring buffer for received frames
 
+#define LOG_PREFIX "supercamera: "
+
 struct camera_dev {
     struct usb_device *udev;
     struct usb_interface *interface;
@@ -92,7 +94,7 @@ struct camera_dev {
 
 static void dump_packet(struct camera_dev *dev, unsigned char *data, int length)
 {
-    printk(KERN_INFO "Camera: Packet %zu (%d bytes): ", dev->packet_count, length);
+    printk(KERN_INFO LOG_PREFIX "Packet %zu (%d bytes): ", dev->packet_count, length);
     for (int i = 0; i < min(16, length); i++) {
         printk(KERN_CONT "%02x ", data[i]);
     }
@@ -133,7 +135,7 @@ static void process_data(struct camera_dev *dev, unsigned char *data, int length
     dev->packet_count++;
     if (length < IMAGE_HEADER_SIZE || header->header.magic != MAGIC_DATA ||
             header->header.type != TYPE_IMAGE || header->header.length + HEADER_SIZE != length) {
-        printk(KERN_WARNING "Camera: Invalid packet %zu", dev->packet_count);
+        printk(KERN_WARNING LOG_PREFIX "Invalid packet %zu", dev->packet_count);
         dump_packet(dev, data, length);
         return;
     }
@@ -145,14 +147,14 @@ static void process_data(struct camera_dev *dev, unsigned char *data, int length
     if (length > IMAGE_HEADER_SIZE) {
         struct camera_frame_header *frame = check_frame(dev->current_frame);
         if (!frame) {
-            printk(KERN_ERR "Camera: Frame buffer corrupted! %p/%p/%p/%p",
+            printk(KERN_ERR LOG_PREFIX "Frame buffer corrupted! %p/%p/%p/%p",
                     dev->framebuffer, dev->read_frame, dev->current_frame, dev->framebuffer_limit);
             return;
         }
 
         unsigned char *framedata = frame_data(frame);
         if (header->index != frame->index && frame->length) {
-            printk(KERN_INFO "Camera: Received image %u, size %u",
+            printk(KERN_INFO LOG_PREFIX "Received image %u, size %u",
                     frame->index, frame->length);
             if (framedata[0] == 0xff && framedata[1] == 0xd8 &&
                     framedata[frame->length - 2] == 0xff && framedata[frame->length - 1] == 0xd9) {
@@ -163,11 +165,11 @@ static void process_data(struct camera_dev *dev, unsigned char *data, int length
                 dev->images_received++;
                 if (!dev->max_lag && dev->current_frame == dev->framebuffer) {
                     dev->max_lag = dev->images_received / 2;
-                    printk(KERN_INFO "Camera: Max. client lag is %zu frames", dev->max_lag);
+                    printk(KERN_INFO LOG_PREFIX "Max. client lag is %zu frames", dev->max_lag);
                 }
                 wake_up_interruptible(&dev->read_wait);
             } else {
-                printk(KERN_WARNING "Camera: Image %u is corrupt, skipping", frame->index);
+                printk(KERN_WARNING LOG_PREFIX "Image %u is corrupt, skipping", frame->index);
                 init_frame(frame, header->index);
             }
         }
@@ -179,7 +181,7 @@ static void process_data(struct camera_dev *dev, unsigned char *data, int length
             memcpy(framedata + frame->length, data + IMAGE_HEADER_SIZE, payload_length);
             frame->length += payload_length;
         } else {
-            printk(KERN_WARNING "Camera: Image %u exceeds buffer size", frame->index);
+            printk(KERN_WARNING LOG_PREFIX "Image %u exceeds buffer size", frame->index);
         }
     }
 }
@@ -194,12 +196,12 @@ static int send_command(struct camera_dev *dev, unsigned char *data, int len)
                          data, len, &actual_length, 5000);
     
     if (result) {
-        printk(KERN_ERR "Camera: Failed to send command: %d", result);
+        printk(KERN_ERR LOG_PREFIX "Failed to send command: %d", result);
         return result;
     }
     
     if (actual_length != len) {
-        printk(KERN_WARNING "Camera: Short write (%d / %d)", actual_length, len);
+        printk(KERN_WARNING LOG_PREFIX "Short write (%d / %d)", actual_length, len);
     }
     
     return 0;
@@ -213,7 +215,7 @@ static void camera_urb_complete(struct urb *urb)
     // Handle URB status
     if (status) {
         if (!(status == -ENOENT || status == -ECONNRESET || status == -ESHUTDOWN)) {
-            printk(KERN_ERR "Camera: URB error %d", status);
+            printk(KERN_ERR LOG_PREFIX "URB error %d", status);
         }
         return;
     }
@@ -228,7 +230,7 @@ static void camera_urb_complete(struct urb *urb)
     if (dev->streaming) {
         status = usb_submit_urb(urb, GFP_ATOMIC);
         if (status) {
-            printk(KERN_ERR "Camera: Failed to resubmit URB: %d", status);
+            printk(KERN_ERR LOG_PREFIX "Failed to resubmit URB: %d", status);
         }
     }
 }
@@ -255,7 +257,7 @@ static int start_streaming(struct camera_dev *dev)
     // Set alt setting to 1
     result = usb_set_interface(dev->udev, INTERFACE_NUM, 1);
     if (result) {
-        printk(KERN_ERR "Camera: Failed to set alt setting: %d", result);
+        printk(KERN_ERR LOG_PREFIX "Failed to set alt setting: %d", result);
         goto error_start_streaming;
     }
     
@@ -278,7 +280,7 @@ static int start_streaming(struct camera_dev *dev)
     // Submit URB
     result = usb_submit_urb(dev->urb, GFP_KERNEL);
     if (result) {
-        printk(KERN_ERR "Camera: Failed to submit URB: %d", result);
+        printk(KERN_ERR LOG_PREFIX "Failed to submit URB: %d", result);
         goto error_start_streaming;
     }
     
@@ -370,7 +372,7 @@ static ssize_t camera_read(struct file *file, char __user *buf, size_t count, lo
     }
     
     if (!dev->max_lag) {
-        printk(KERN_INFO "Camera: Waiting for max_lag calculation");
+        printk(KERN_INFO LOG_PREFIX "Waiting for max_lag calculation");
 
         // No ready frames - wait or return
         mutex_unlock(&dev->io_mutex);
@@ -390,7 +392,7 @@ static ssize_t camera_read(struct file *file, char __user *buf, size_t count, lo
 
     // check for client lagging behind
     if (dev->images_received - dev->images_read > dev->max_lag) {
-        printk(KERN_INFO "Camera: Client is too slow (%zu/%zu)), re-setting read_frame", dev->images_read, dev->images_received);
+        printk(KERN_INFO LOG_PREFIX "Client is too slow (%zu/%zu)), re-setting read_frame", dev->images_read, dev->images_received);
         dev->read_frame = dev->current_frame;
         dev->read_pos = 0;
         dev->images_read = dev->images_received;
@@ -398,7 +400,7 @@ static ssize_t camera_read(struct file *file, char __user *buf, size_t count, lo
 
     // Find ready frame
     while (dev->read_frame == dev->current_frame) {
-        printk(KERN_INFO "Camera: No image available, waiting");
+        printk(KERN_INFO LOG_PREFIX "No image available, waiting");
 
         // No ready frames - wait or return
         mutex_unlock(&dev->io_mutex);
@@ -419,7 +421,7 @@ static ssize_t camera_read(struct file *file, char __user *buf, size_t count, lo
     
     struct camera_frame_header *frame = check_frame(dev->read_frame);
     if (!frame) {
-        printk(KERN_ERR "Camera: Invalid frame buffer! %p/%p/%p/%p",
+        printk(KERN_ERR LOG_PREFIX "Invalid frame buffer! %p/%p/%p/%p",
                 dev->framebuffer, dev->read_frame, dev->current_frame, dev->framebuffer_limit);
         mutex_unlock(&dev->io_mutex);
         return -EIO;
@@ -428,7 +430,7 @@ static ssize_t camera_read(struct file *file, char __user *buf, size_t count, lo
     // Calculate bytes to read
     bytes_read = min_t(size_t, count, frame->length - dev->read_pos);
 
-    printk(KERN_INFO "Camera: Reading image %d from position %zu, size %zd", frame->index, dev->read_pos, bytes_read);
+    printk(KERN_INFO LOG_PREFIX "Reading image %d from position %zu, size %zd", frame->index, dev->read_pos, bytes_read);
 
     if (bytes_read <= 0) {
         // End of frame - move to next
@@ -496,7 +498,7 @@ static int camera_probe(struct usb_interface *interface, const struct usb_device
     // Initialize frame buffers
     dev->framebuffer = kmalloc(FRAMEBUFFER_SIZE, GFP_KERNEL);
     if (!dev->framebuffer) {
-        printk(KERN_ERR "Camera: Failed to allocate frame buffer");
+        printk(KERN_ERR LOG_PREFIX "Failed to allocate frame buffer");
         goto error_alloc_frames;
     }
     dev->framebuffer_limit = (void *) dev->framebuffer + FRAMEBUFFER_SIZE - BUFFER_SIZE;
@@ -514,7 +516,7 @@ static int camera_probe(struct usb_interface *interface, const struct usb_device
     // Create character device
     result = alloc_chrdev_region(&dev->dev_num, 0, 1, "supercamera");
     if (result < 0) {
-        printk(KERN_ERR "Camera: Failed to allocate device number");
+        printk(KERN_ERR LOG_PREFIX "Failed to allocate device number");
         goto error_alloc_chrdev;
     }
     
@@ -523,7 +525,7 @@ static int camera_probe(struct usb_interface *interface, const struct usb_device
     
     result = cdev_add(&dev->cdev, dev->dev_num, 1);
     if (result < 0) {
-        printk(KERN_ERR "Camera: Failed to add character device");
+        printk(KERN_ERR LOG_PREFIX "Failed to add character device");
         goto error_cdev_add;
     }
     
@@ -531,7 +533,7 @@ static int camera_probe(struct usb_interface *interface, const struct usb_device
     dev->class = class_create("supercamera");
     if (IS_ERR(dev->class)) {
         result = PTR_ERR(dev->class);
-        printk(KERN_ERR "Camera: Failed to create device class");
+        printk(KERN_ERR LOG_PREFIX "Failed to create device class");
         goto error_class_create;
     }
     dev->class->devnode = camera_devnode;
@@ -540,21 +542,21 @@ static int camera_probe(struct usb_interface *interface, const struct usb_device
     dev->device = device_create(dev->class, NULL, dev->dev_num, NULL, "supercamera");
     if (IS_ERR(dev->device)) {
         result = PTR_ERR(dev->device);
-        printk(KERN_ERR "Camera: Failed to create device");
+        printk(KERN_ERR LOG_PREFIX "Failed to create device");
         goto error_device_create;
     }
     
     // Start streaming
     result = start_streaming(dev);
     if (result < 0) {
-        printk(KERN_ERR "Camera: Failed to start streaming: %d", result);
+        printk(KERN_ERR LOG_PREFIX "Failed to start streaming: %d", result);
         goto error_start_streaming;
     }
     
     // Store device in interface
     usb_set_intfdata(interface, dev);
     
-    printk(KERN_INFO "Camera: Device connected (/dev/supercamera)");
+    printk(KERN_INFO LOG_PREFIX "Device connected (/dev/supercamera)");
     return 0;
     
 error_start_streaming:
@@ -598,7 +600,7 @@ static void camera_disconnect(struct usb_interface *interface)
     usb_put_dev(dev->udev);
     kfree(dev);
     
-    printk(KERN_INFO "Camera: Device disconnected");
+    printk(KERN_INFO LOG_PREFIX "Device disconnected");
 }
 
 // USB device ID table
