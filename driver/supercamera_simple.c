@@ -235,30 +235,16 @@ static void camera_urb_complete(struct urb *urb)
     }
 }
 
-// Start streaming
-static int start_streaming(struct camera_dev *dev)
+// Initialize device
+static int init_usb_device(struct camera_dev *dev)
 {
     int result;
-    
-    // Allocate URB
-    dev->urb = usb_alloc_urb(0, GFP_KERNEL);
-    if (!dev->urb) {
-        return -ENOMEM;
-    }
-    
-    // Allocate buffer
-    dev->urb_buffer = kmalloc(BUFFER_SIZE, GFP_KERNEL);
-    if (!dev->urb_buffer) {
-        usb_free_urb(dev->urb);
-        dev->urb = NULL;
-        return -ENOMEM;
-    }
     
     // Set alt setting to 1
     result = usb_set_interface(dev->udev, INTERFACE_NUM, 1);
     if (result) {
         printk(KERN_ERR LOG_PREFIX "Failed to set alt setting: %d\n", result);
-        goto error_start_streaming;
+        return result;
     }
     
     // Initialize connect command
@@ -270,7 +256,36 @@ static int start_streaming(struct camera_dev *dev)
     // Send connect command
     result = send_command(dev, dev->urb_buffer, HEADER_SIZE);
     if (result) {
-        goto error_start_streaming;
+        return result;
+    }
+
+    return 0;
+}
+
+// Reset device
+static int reset_usb_device(struct camera_dev *dev)
+{
+    int result;
+
+    // Reset alt setting
+    result = usb_set_interface(dev->udev, INTERFACE_NUM, 0);
+    if (result) {
+        printk(KERN_ERR LOG_PREFIX "Failed to reset alt setting: %d\n", result);
+        return result;
+    }
+
+    return 0;
+}
+
+// Start streaming
+static int start_streaming(struct camera_dev *dev)
+{
+    int result;
+
+    // Allocate URB
+    dev->urb = usb_alloc_urb(0, GFP_KERNEL);
+    if (!dev->urb) {
+        return -ENOMEM;
     }
     
     // Fill URB
@@ -292,10 +307,8 @@ static int start_streaming(struct camera_dev *dev)
     return 0;
 
 error_start_streaming:
-    kfree(dev->urb_buffer);
     usb_free_urb(dev->urb);
     dev->urb = NULL;
-    dev->urb_buffer = NULL;
     return result;
 }
 
@@ -312,13 +325,6 @@ static void stop_streaming(struct camera_dev *dev)
         usb_free_urb(dev->urb);
         dev->urb = NULL;
     }
-    
-    // Free buffer
-    kfree(dev->urb_buffer);
-    dev->urb_buffer = NULL;
-    
-    // Reset alt setting
-    usb_set_interface(dev->udev, INTERFACE_NUM, 0);
     
     dev->streaming = false;
 }
@@ -339,6 +345,13 @@ static int camera_open(struct inode *inode, struct file *file)
         return -EBUSY;
     }
     
+    // Start streaming
+    printk(KERN_INFO LOG_PREFIX "Client connected, start streamingßn");
+    int result = start_streaming(dev);
+    if (result < 0) {
+        printk(KERN_ERR LOG_PREFIX "Failed to start streaming: %d\n", result);
+    }
+    
     dev->device_open = true;
     dev->read_pos = 0;
     dev->read_frame = dev->current_frame;
@@ -355,7 +368,12 @@ static int camera_release(struct inode *inode, struct file *file)
     struct camera_dev *dev = file->private_data;
     
     mutex_lock(&dev->io_mutex);
+    
+    printk(KERN_INFO LOG_PREFIX "Client disconnected, stop streaming\n");
+    stop_streaming(dev);
+    
     dev->device_open = false;
+    
     mutex_unlock(&dev->io_mutex);
     
     return 0;
@@ -505,6 +523,13 @@ static int camera_probe(struct usb_interface *interface, const struct usb_device
     dev->current_frame = dev->read_frame = dev->framebuffer;
     init_frame(dev->current_frame, 0);
 
+    // Allocate buffer
+    dev->urb_buffer = kmalloc(BUFFER_SIZE, GFP_KERNEL);
+    if (!dev->urb_buffer) {
+        printk(KERN_ERR LOG_PREFIX "Failed to allocate URB buffer\n");
+        goto error_alloc_frames;
+    }
+
     // Initialize device
     dev->udev = usb_get_dev(udev);
     dev->interface = interface;
@@ -546,10 +571,9 @@ static int camera_probe(struct usb_interface *interface, const struct usb_device
         goto error_device_create;
     }
     
-    // Start streaming
-    result = start_streaming(dev);
+    // Initialize device
+    result = init_usb_device(dev);
     if (result < 0) {
-        printk(KERN_ERR LOG_PREFIX "Failed to start streaming: %d\n", result);
         goto error_start_streaming;
     }
     
@@ -570,6 +594,7 @@ error_cdev_add:
 error_alloc_chrdev:
     usb_put_dev(dev->udev);
 error_alloc_frames:
+    kfree(dev->urb_buffer);
     kfree(dev->framebuffer);
     kfree(dev);
     return result;
@@ -586,6 +611,7 @@ static void camera_disconnect(struct usb_interface *interface)
     
     // Stop streaming
     stop_streaming(dev);
+    reset_usb_device(dev);
     
     // Clean up character device
     device_destroy(dev->class, dev->dev_num);
@@ -594,6 +620,7 @@ static void camera_disconnect(struct usb_interface *interface)
     unregister_chrdev_region(dev->dev_num, 1);
     
     // Free frame buffers
+    kfree(dev->urb_buffer);
     kfree(dev->framebuffer);
     
     // Free device
