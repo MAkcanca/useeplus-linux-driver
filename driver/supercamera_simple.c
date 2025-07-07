@@ -452,6 +452,13 @@ static ssize_t camera_read(struct file *file, char __user *buf, size_t count, lo
     return bytes_read;
 }
 
+static char* camera_devnode(const struct device *dev, umode_t *mode) {
+    if (mode) {
+        *mode = 0444;
+    }
+    return NULL;
+}
+
 // Probe function
 static int camera_probe(struct usb_interface *interface, const struct usb_device_id *id)
 {
@@ -518,6 +525,7 @@ static int camera_probe(struct usb_interface *interface, const struct usb_device
         printk(KERN_ERR "Camera: Failed to create device class");
         goto error_class_create;
     }
+    dev->class->devnode = camera_devnode;
     
     // Create device file
     dev->device = device_create(dev->class, NULL, dev->dev_num, NULL, "supercamera");
