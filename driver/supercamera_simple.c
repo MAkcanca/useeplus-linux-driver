@@ -62,6 +62,8 @@ struct camera_dev {
     int current_frame;
     int read_frame;
     
+    size_t packet_count;
+
     // Character device
     struct cdev cdev;
     dev_t dev_num;
@@ -94,20 +96,24 @@ static struct file_operations camera_fops = {
     .read = camera_read,
 };
 
+static void dump_packet(struct camera_dev *dev, unsigned char *data, int length)
+{
+    printk(KERN_INFO "Camera: Packet %zu (%d bytes): ", dev->packet_count, length);
+    for (int i = 0; i < min(16, length); i++) {
+        printk(KERN_CONT "%02x ", data[i]);
+    }
+    printk(KERN_CONT "\n");
+}
+
 // Process received data by adding it to the current frame
 static void process_data(struct camera_dev *dev, unsigned char *data, int length)
 {
     struct camera_frame *frame = &dev->frames[dev->current_frame];
-    static int packet_count = 0;
 
     // Debug first few packets
-    if (packet_count < 10) {
-        printk(KERN_INFO "Camera: Packet %d (%d bytes): ", packet_count, length);
-        for (int i = 0; i < min(16, length); i++) {
-            printk(KERN_CONT "%02x ", data[i]);
-        }
-        printk(KERN_CONT "\n");
-        packet_count++;
+    dev->packet_count++;
+    if (dev->packet_count <= 10) {
+        dump_packet(dev, data, length);
     }
 
     // Relaxed header check - only check first 3 bytes
@@ -333,6 +339,7 @@ static int start_streaming(struct camera_dev *dev)
         goto error_start_streaming;
     }
     
+    dev->packet_count = 0;
     dev->streaming = true;
     return 0;
 
