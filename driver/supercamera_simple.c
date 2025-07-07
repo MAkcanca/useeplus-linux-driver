@@ -82,20 +82,6 @@ struct camera_dev {
     wait_queue_head_t read_wait;
 };
 
-static int major_num;
-
-// Forward declarations
-static int camera_open(struct inode *inode, struct file *file);
-static int camera_release(struct inode *inode, struct file *file);
-static ssize_t camera_read(struct file *file, char __user *buf, size_t count, loff_t *pos);
-
-static struct file_operations camera_fops = {
-    .owner = THIS_MODULE,
-    .open = camera_open,
-    .release = camera_release,
-    .read = camera_read,
-};
-
 static void dump_packet(struct camera_dev *dev, unsigned char *data, int length)
 {
     printk(KERN_INFO "Camera: Packet %zu (%d bytes): ", dev->packet_count, length);
@@ -242,6 +228,7 @@ static void process_data(struct camera_dev *dev, unsigned char *data, int length
         }
     }
 }
+
 // Send command to camera
 static int send_command(struct camera_dev *dev, unsigned char *data, int len)
 {
@@ -290,6 +277,7 @@ static void camera_urb_complete(struct urb *urb)
         }
     }
 }
+
 // Start streaming
 static int start_streaming(struct camera_dev *dev)
 {
@@ -495,6 +483,13 @@ static char* camera_devnode(const struct device *dev, umode_t *mode) {
     return NULL;
 }
 
+static struct file_operations camera_fops = {
+    .owner = THIS_MODULE,
+    .open = camera_open,
+    .release = camera_release,
+    .read = camera_read,
+};
+
 // Probe function
 static int camera_probe(struct usb_interface *interface, const struct usb_device_id *id)
 {
@@ -535,8 +530,6 @@ static int camera_probe(struct usb_interface *interface, const struct usb_device
         printk(KERN_ERR "Camera: Failed to allocate device number");
         goto error_alloc_chrdev;
     }
-    
-    major_num = MAJOR(dev->dev_num);
     
     cdev_init(&dev->cdev, &camera_fops);
     dev->cdev.owner = THIS_MODULE;
