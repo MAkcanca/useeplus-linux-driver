@@ -41,15 +41,18 @@ struct camera_image_header {
 
 #define IMAGE_HEADER_SIZE 12    // sizeof(struct camera_image_header)
 
-#define BUFFER_SIZE (64*1024)  // Buffer for USB transfers
-#define MAX_FRAMES  5          // Number of frames to keep in ring buffer
+// Ring buffer entry header
+struct camera_frame_header {
+    unsigned int magic;
+    unsigned int index;
+    unsigned int length;
+} __attribute__((packed));
 
-// Simple frame container
-struct camera_frame {
-    unsigned char *data;
-    size_t size;
-    bool ready;
-};
+#define FRAME_HEADER_SIZE 12    // sizeof(struct camera_frame_header)
+#define FRAME_HEADER_MAGIC 0xaabbccdd
+
+#define BUFFER_SIZE (64*1024)  // Buffer for USB transfers
+#define FRAMEBUFFER_SIZE (4*BUFFER_SIZE)    // Ring buffer for received frames
 
 struct camera_dev {
     struct usb_device *udev;
@@ -58,9 +61,10 @@ struct camera_dev {
     unsigned char *urb_buffer;
     
     // Frame ring buffer
-    struct camera_frame frames[MAX_FRAMES];
-    int current_frame;
-    int read_frame;
+    void *framebuffer;
+    struct camera_frame_header *framebuffer_limit;
+    struct camera_frame_header *current_frame;
+    struct camera_frame_header *read_frame;
     
     size_t packet_count;
 
@@ -91,140 +95,84 @@ static void dump_packet(struct camera_dev *dev, unsigned char *data, int length)
     printk(KERN_CONT "\n");
 }
 
+static struct camera_frame_header *next_frame(struct camera_dev *dev, struct camera_frame_header *frame) {
+    struct camera_frame_header *next = (void *) (frame + 1) + frame->length;
+    if (next > dev->framebuffer_limit) {
+        next = dev->framebuffer;
+    }
+    return next;
+}
+
+static void init_frame(struct camera_frame_header *frame, unsigned int index) {
+    frame->magic = FRAME_HEADER_MAGIC;
+    frame->index = index;
+    frame->length = 0;
+}
+
+static struct camera_frame_header *check_frame(struct camera_frame_header* frame) {
+    if (frame->magic == FRAME_HEADER_MAGIC) {
+        return frame;
+    }
+    return NULL;
+}
+
+static unsigned char *frame_data(struct camera_frame_header* frame) {
+    return (unsigned char *) (frame + 1);
+}
+
 // Process received data by adding it to the current frame
 static void process_data(struct camera_dev *dev, unsigned char *data, int length)
 {
-    struct camera_frame *frame = &dev->frames[dev->current_frame];
+    struct camera_image_header *header = (struct camera_image_header *)data;
 
     // Debug first few packets
     dev->packet_count++;
+    if (length < IMAGE_HEADER_SIZE || header->header.magic != MAGIC_DATA ||
+            header->header.type != TYPE_IMAGE || header->header.length + HEADER_SIZE != length) {
+        printk(KERN_WARNING "Camera: Invalid packet %zu", dev->packet_count);
+        dump_packet(dev, data, length);
+        return;
+    }
     if (dev->packet_count <= 10) {
         dump_packet(dev, data, length);
     }
 
-    // Relaxed header check - only check first 3 bytes
-    if (length >= 3 && data[0] == 0xaa && data[1] == 0xbb && data[2] == 0x07) {
-        // Valid packet header - using consistent 12-byte header
-
-        // Allocate frame buffer if needed
-        if (!frame->data) {
-            frame->data = kmalloc(BUFFER_SIZE, GFP_ATOMIC);
-            if (!frame->data) {
-                printk(KERN_ERR "Camera: Failed to allocate frame buffer");
-                return;
-            }
-            frame->size = 0;
-            frame->ready = false;
+    // Skip header and append payload data to current frame
+    if (length > IMAGE_HEADER_SIZE) {
+        struct camera_frame_header *frame = check_frame(dev->current_frame);
+        if (!frame) {
+            printk(KERN_ERR "Camera: Frame buffer corrupted! %p/%p/%p/%p",
+                    dev->framebuffer, dev->read_frame, dev->current_frame, dev->framebuffer_limit);
+            return;
         }
 
-        // Skip header and append payload data to current frame
-        if (length > IMAGE_HEADER_SIZE) {
-            int payload_size = length - IMAGE_HEADER_SIZE;
-
-            // Check if we have enough space
-            if (frame->size + payload_size <= BUFFER_SIZE) {
-                memcpy(frame->data + frame->size, data + IMAGE_HEADER_SIZE, payload_size);
-                frame->size += payload_size;
+        unsigned char *framedata = frame_data(frame);
+        if (header->index != frame->index && frame->length) {
+            printk(KERN_INFO "Camera: Received image %u, size %u",
+                    frame->index, frame->length);
+            if (framedata[0] == 0xff && framedata[1] == 0xd8 &&
+                    framedata[frame->length - 2] == 0xff && framedata[frame->length - 1] == 0xd9) {
+                frame = next_frame(dev, frame);
+                init_frame(frame, header->index);
+                framedata = (unsigned char*) (frame + 1);
+                dev->current_frame = frame;
+                wake_up_interruptible(&dev->read_wait);
             } else {
-                // Current frame is full - finalize it and move to next
-                frame->ready = true;
-                printk(KERN_INFO "Camera: Frame %d ready (buffer full), size %zu", 
-                      dev->current_frame, frame->size);
-                wake_up_interruptible(&dev->read_wait);
-
-                // Move to next frame
-                dev->current_frame = (dev->current_frame + 1) % MAX_FRAMES;
-                frame = &dev->frames[dev->current_frame];
-
-                // Initialize new frame if needed
-                if (!frame->data) {
-                    frame->data = kmalloc(BUFFER_SIZE, GFP_ATOMIC);
-                    if (!frame->data) {
-                        printk(KERN_ERR "Camera: Failed to allocate frame buffer");
-                        return;
-                    }
-                }
-                frame->size = 0;
-                frame->ready = false;
-
-                // Add this payload to the new frame
-                memcpy(frame->data, data + IMAGE_HEADER_SIZE, payload_size);
-                frame->size = payload_size;
-            }
-
-            // Look for JPEG EOI marker to detect complete image
-            for (int i = 0; i < payload_size - 1; i++) {
-                if (data[IMAGE_HEADER_SIZE + i] == 0xFF && data[IMAGE_HEADER_SIZE + i + 1] == 0xD9) {
-                    // Found JPEG EOI marker
-                    printk(KERN_INFO "Camera: Found EOI at packet offset %d, frame size %zu", 
-                           IMAGE_HEADER_SIZE + i, frame->size);
-                }
-            }
-
-            // Make finished frame available after accumulating enough data
-            // Reduced threshold to 64KB which seems enough based on your results
-            if (frame->size >= 64000 && !frame->ready) {
-                frame->ready = true;
-                printk(KERN_INFO "Camera: Frame %d ready (size threshold), size %zu", 
-                       dev->current_frame, frame->size);
-                wake_up_interruptible(&dev->read_wait);
-
-                // Move to next frame
-                dev->current_frame = (dev->current_frame + 1) % MAX_FRAMES;
-                frame = &dev->frames[dev->current_frame];
-
-                // Initialize next frame
-                if (!frame->data) {
-                    frame->data = kmalloc(BUFFER_SIZE, GFP_ATOMIC);
-                    if (!frame->data) {
-                        printk(KERN_ERR "Camera: Failed to allocate frame buffer");
-                        return;
-                    }
-                }
-                frame->size = 0;
-                frame->ready = false;
+                printk(KERN_WARNING "Camera: Image %u is corrupt, skipping",
+                        frame->index);
+                init_frame(frame, header->index);
             }
         }
-    } else {
-        // Still log invalid headers but continue processing the data
-        // This approach ensures we don't miss data even if headers change
-        if (length >= 4) {
-            printk(KERN_INFO "Camera: Invalid packet header: %02x %02x %02x %02x",
-                   data[0], data[1], data[2], data[3]);
-        }
 
-        // Try to process data anyway - it might contain valid image data
-        if (frame->data) {
-            // Check if we have enough space
-            if (frame->size + length <= BUFFER_SIZE) {
-                memcpy(frame->data + frame->size, data, length);
-                frame->size += length;
-            } else {
-                // Current frame is full - finalize it and move to next
-                frame->ready = true;
-                printk(KERN_INFO "Camera: Frame %d ready (buffer full from invalid packet), size %zu", 
-                      dev->current_frame, frame->size);
-                wake_up_interruptible(&dev->read_wait);
+        int payload_length = length - IMAGE_HEADER_SIZE;
 
-                // Move to next frame
-                dev->current_frame = (dev->current_frame + 1) % MAX_FRAMES;
-                frame = &dev->frames[dev->current_frame];
-
-                // Initialize new frame if needed
-                if (!frame->data) {
-                    frame->data = kmalloc(BUFFER_SIZE, GFP_ATOMIC);
-                    if (!frame->data) {
-                        printk(KERN_ERR "Camera: Failed to allocate frame buffer");
-                        return;
-                    }
-                }
-                frame->size = 0;
-                frame->ready = false;
-
-                // Add this data to the new frame
-                memcpy(frame->data, data, length);
-                frame->size = length;
-            }
+        // Check if we have enough space
+        if (frame->length + payload_length <= BUFFER_SIZE - FRAME_HEADER_SIZE) {
+            memcpy(framedata + frame->length, data + IMAGE_HEADER_SIZE, payload_length);
+            frame->length += payload_length;
+        } else {
+            printk(KERN_WARNING "Camera: Image %u exceeds buffer size",
+                     frame->index);
         }
     }
 }
@@ -381,7 +329,7 @@ static int camera_open(struct inode *inode, struct file *file)
     
     dev->device_open = true;
     dev->read_pos = 0;
-    dev->read_frame = 0;
+    dev->read_frame = dev->current_frame;
     
     mutex_unlock(&dev->io_mutex);
     
@@ -411,18 +359,17 @@ static ssize_t camera_read(struct file *file, char __user *buf, size_t count, lo
     }
     
     // Find ready frame
-    int frame_idx = dev->read_frame;
-    int checked = 0;
-    
-    while (checked < MAX_FRAMES) {
-        if (dev->frames[frame_idx].ready) {
-            break;
-        }
-        frame_idx = (frame_idx + 1) % MAX_FRAMES;
-        checked++;
+    struct camera_frame_header *frame = check_frame(dev->read_frame);
+    if (!frame) {
+        printk(KERN_ERR "Camera: Invalid frame buffer (reading too slowly?)");
+        dev->read_frame = dev->current_frame;
+        dev->read_pos = 0;
     }
-    
-    if (checked == MAX_FRAMES) {
+
+    while (dev->read_frame == dev->current_frame) {
+        printk(KERN_INFO "Camera: No image available, waiting");
+        dev->read_pos = 0;
+
         // No ready frames - wait or return
         mutex_unlock(&dev->io_mutex);
         
@@ -431,7 +378,7 @@ static ssize_t camera_read(struct file *file, char __user *buf, size_t count, lo
         }
         
         if (wait_event_interruptible(dev->read_wait, 
-                                    dev->frames[dev->read_frame].ready)) {
+                                    dev->read_frame != dev->current_frame)) {
             return -ERESTARTSYS;
         }
         
@@ -440,38 +387,44 @@ static ssize_t camera_read(struct file *file, char __user *buf, size_t count, lo
         }
     }
     
-    dev->read_frame = frame_idx;
-    struct camera_frame *frame = &dev->frames[dev->read_frame];
-    
-    if (frame->ready) {
-        // Calculate bytes to read
-        bytes_read = min_t(size_t, count, frame->size - dev->read_pos);
-        
-        if (bytes_read <= 0) {
-            // End of frame - move to next
-            frame->ready = false;  // Mark as consumed
-            dev->read_frame = (dev->read_frame + 1) % MAX_FRAMES;
-            dev->read_pos = 0;
-            mutex_unlock(&dev->io_mutex);
-            return 0;
-        }
-        
-        // Copy data to user
-        if (copy_to_user(buf, frame->data + dev->read_pos, bytes_read)) {
-            mutex_unlock(&dev->io_mutex);
-            return -EFAULT;
-        }
-        
-        dev->read_pos += bytes_read;
-        
-        // If end of frame, mark as not ready and move to next
-        if (dev->read_pos >= frame->size) {
-            frame->ready = false;
-            dev->read_frame = (dev->read_frame + 1) % MAX_FRAMES;
-            dev->read_pos = 0;
-        }
+    frame = check_frame(dev->read_frame);
+    if (!frame) {
+        printk(KERN_ERR "Camera: Invalid frame buffer! %p/%p/%p/%p",
+                dev->framebuffer, dev->read_frame, dev->current_frame, dev->framebuffer_limit);
+        mutex_unlock(&dev->io_mutex);
+        return -EIO;
     }
     
+    printk(KERN_INFO "Camera: Reading image %d from position %zu", frame->index, dev->read_pos);
+    
+    // Calculate bytes to read
+    bytes_read = min_t(size_t, count, frame->length - dev->read_pos);
+
+    if (bytes_read <= 0) {
+        // End of frame - move to next
+        frame = next_frame(dev, frame);
+        dev->read_frame = frame;
+        dev->read_pos = 0;
+        mutex_unlock(&dev->io_mutex);
+        return 0;
+    }
+
+    // Copy data to user
+    unsigned char *framedata = frame_data(frame);
+    if (copy_to_user(buf, framedata + dev->read_pos, bytes_read)) {
+        mutex_unlock(&dev->io_mutex);
+        return -EFAULT;
+    }
+
+    dev->read_pos += bytes_read;
+
+    // If end of frame, mark as not ready and move to next
+    if (dev->read_pos >= frame->length) {
+        frame = next_frame(dev, frame);
+        dev->read_frame = frame;
+        dev->read_pos = 0;
+    }
+
     mutex_unlock(&dev->io_mutex);
     return bytes_read;
 }
@@ -496,7 +449,6 @@ static int camera_probe(struct usb_interface *interface, const struct usb_device
     struct usb_device *udev = interface_to_usbdev(interface);
     struct camera_dev *dev;
     int result;
-    int i;
     
     // Check interface
     if (interface->cur_altsetting->desc.bInterfaceNumber != INTERFACE_NUM) {
@@ -509,6 +461,16 @@ static int camera_probe(struct usb_interface *interface, const struct usb_device
         return -ENOMEM;
     }
     
+    // Initialize frame buffers
+    dev->framebuffer = kmalloc(FRAMEBUFFER_SIZE, GFP_KERNEL);
+    if (!dev->framebuffer) {
+        printk(KERN_ERR "Camera: Failed to allocate frame buffer");
+        goto error_alloc_frames;
+    }
+    dev->framebuffer_limit = dev->framebuffer + FRAMEBUFFER_SIZE - BUFFER_SIZE;
+    dev->current_frame = dev->read_frame = dev->framebuffer;
+    init_frame(dev->current_frame, 0);
+
     // Initialize device
     dev->udev = usb_get_dev(udev);
     dev->interface = interface;
@@ -516,13 +478,6 @@ static int camera_probe(struct usb_interface *interface, const struct usb_device
     dev->device_open = false;
     mutex_init(&dev->io_mutex);
     init_waitqueue_head(&dev->read_wait);
-    
-    // Initialize frame buffers
-    for (i = 0; i < MAX_FRAMES; i++) {
-        dev->frames[i].data = NULL;
-        dev->frames[i].size = 0;
-        dev->frames[i].ready = false;
-    }
     
     // Create character device
     result = alloc_chrdev_region(&dev->dev_num, 0, 1, "supercamera");
@@ -580,6 +535,8 @@ error_cdev_add:
     unregister_chrdev_region(dev->dev_num, 1);
 error_alloc_chrdev:
     usb_put_dev(dev->udev);
+error_alloc_frames:
+    kfree(dev->framebuffer);
     kfree(dev);
     return result;
 }
@@ -603,9 +560,7 @@ static void camera_disconnect(struct usb_interface *interface)
     unregister_chrdev_region(dev->dev_num, 1);
     
     // Free frame buffers
-    for (int i = 0; i < MAX_FRAMES; i++) {
-        kfree(dev->frames[i].data);
-    }
+    kfree(dev->framebuffer);
     
     // Free device
     usb_put_dev(dev->udev);
