@@ -13,7 +13,33 @@
 #define INTERFACE_NUM 1
 #define EP_IN  0x81
 #define EP_OUT 0x01
-#define CONNECT_CMD_SIZE 5
+
+// common header for all data packets
+struct camera_header {
+    unsigned short magic;
+    unsigned char type;
+    unsigned short length;
+} __attribute__((packed));
+
+#define HEADER_SIZE 5   // sizeof(struct camera_header)
+
+// values for magic
+#define MAGIC_COMMAND   0xaabb  // host to device
+#define MAGIC_DATA      0xbbaa  // device to host
+// values for type
+#define TYPE_START      0x05    // Command: start streaming, no payload
+#define TYPE_IMAGE      0x07    // Data: image, payload: see camera_image_header
+
+// header for image packets
+struct camera_image_header {
+    struct camera_header header;
+    unsigned char index;    // image index, might jump...
+    unsigned char data1;    // unknown
+    unsigned char data2;    // unknown
+    unsigned int data3;     // unknown
+} __attribute__((packed));
+
+#define IMAGE_HEADER_SIZE 12    // sizeof(struct camera_image_header)
 
 #define BUFFER_SIZE (64*1024)  // Buffer for USB transfers
 #define MAX_FRAMES  5          // Number of frames to keep in ring buffer
@@ -30,9 +56,6 @@ struct camera_dev {
     struct usb_interface *interface;
     struct urb *urb;
     unsigned char *urb_buffer;
-    
-    // Connection command
-    unsigned char connect_cmd[CONNECT_CMD_SIZE];
     
     // Frame ring buffer
     struct camera_frame frames[MAX_FRAMES];
@@ -77,9 +100,6 @@ static void process_data(struct camera_dev *dev, unsigned char *data, int length
     struct camera_frame *frame = &dev->frames[dev->current_frame];
     static int packet_count = 0;
 
-    // Custom header appears to be 12 bytes
-    const int HEADER_SIZE = 12;
-
     // Debug first few packets
     if (packet_count < 10) {
         printk(KERN_INFO "Camera: Packet %d (%d bytes): ", packet_count, length);
@@ -106,12 +126,12 @@ static void process_data(struct camera_dev *dev, unsigned char *data, int length
         }
 
         // Skip header and append payload data to current frame
-        if (length > HEADER_SIZE) {
-            int payload_size = length - HEADER_SIZE;
+        if (length > IMAGE_HEADER_SIZE) {
+            int payload_size = length - IMAGE_HEADER_SIZE;
 
             // Check if we have enough space
             if (frame->size + payload_size <= BUFFER_SIZE) {
-                memcpy(frame->data + frame->size, data + HEADER_SIZE, payload_size);
+                memcpy(frame->data + frame->size, data + IMAGE_HEADER_SIZE, payload_size);
                 frame->size += payload_size;
             } else {
                 // Current frame is full - finalize it and move to next
@@ -136,16 +156,16 @@ static void process_data(struct camera_dev *dev, unsigned char *data, int length
                 frame->ready = false;
 
                 // Add this payload to the new frame
-                memcpy(frame->data, data + HEADER_SIZE, payload_size);
+                memcpy(frame->data, data + IMAGE_HEADER_SIZE, payload_size);
                 frame->size = payload_size;
             }
 
             // Look for JPEG EOI marker to detect complete image
             for (int i = 0; i < payload_size - 1; i++) {
-                if (data[HEADER_SIZE + i] == 0xFF && data[HEADER_SIZE + i + 1] == 0xD9) {
+                if (data[IMAGE_HEADER_SIZE + i] == 0xFF && data[IMAGE_HEADER_SIZE + i + 1] == 0xD9) {
                     // Found JPEG EOI marker
                     printk(KERN_INFO "Camera: Found EOI at packet offset %d, frame size %zu", 
-                           HEADER_SIZE + i, frame->size);
+                           IMAGE_HEADER_SIZE + i, frame->size);
                 }
             }
 
@@ -269,19 +289,6 @@ static int start_streaming(struct camera_dev *dev)
 {
     int result;
     
-    // Set alt setting to 1
-    result = usb_set_interface(dev->udev, INTERFACE_NUM, 1);
-    if (result) {
-        printk(KERN_ERR "Camera: Failed to set alt setting: %d", result);
-        return result;
-    }
-    
-    // Send connect command
-    result = send_command(dev, dev->connect_cmd, CONNECT_CMD_SIZE);
-    if (result) {
-        return result;
-    }
-    
     // Allocate URB
     dev->urb = usb_alloc_urb(0, GFP_KERNEL);
     if (!dev->urb) {
@@ -296,6 +303,25 @@ static int start_streaming(struct camera_dev *dev)
         return -ENOMEM;
     }
     
+    // Set alt setting to 1
+    result = usb_set_interface(dev->udev, INTERFACE_NUM, 1);
+    if (result) {
+        printk(KERN_ERR "Camera: Failed to set alt setting: %d", result);
+        goto error_start_streaming;
+    }
+    
+    // Initialize connect command
+    struct camera_header *header = (struct camera_header *)dev->urb_buffer;
+    header->magic = MAGIC_COMMAND;
+    header->type = TYPE_START;
+    header->length = 0;
+    
+    // Send connect command
+    result = send_command(dev, dev->urb_buffer, HEADER_SIZE);
+    if (result) {
+        goto error_start_streaming;
+    }
+    
     // Fill URB
     usb_fill_bulk_urb(dev->urb, dev->udev, usb_rcvbulkpipe(dev->udev, EP_IN),
                      dev->urb_buffer, BUFFER_SIZE, camera_urb_complete, dev);
@@ -304,15 +330,18 @@ static int start_streaming(struct camera_dev *dev)
     result = usb_submit_urb(dev->urb, GFP_KERNEL);
     if (result) {
         printk(KERN_ERR "Camera: Failed to submit URB: %d", result);
-        kfree(dev->urb_buffer);
-        usb_free_urb(dev->urb);
-        dev->urb = NULL;
-        dev->urb_buffer = NULL;
-        return result;
+        goto error_start_streaming;
     }
     
     dev->streaming = true;
     return 0;
+
+error_start_streaming:
+    kfree(dev->urb_buffer);
+    usb_free_urb(dev->urb);
+    dev->urb = NULL;
+    dev->urb_buffer = NULL;
+    return result;
 }
 
 // Stop streaming
@@ -492,13 +521,6 @@ static int camera_probe(struct usb_interface *interface, const struct usb_device
         dev->frames[i].size = 0;
         dev->frames[i].ready = false;
     }
-    
-    // Initialize connect command
-    dev->connect_cmd[0] = 0xbb;
-    dev->connect_cmd[1] = 0xaa;
-    dev->connect_cmd[2] = 0x05;
-    dev->connect_cmd[3] = 0x00;
-    dev->connect_cmd[4] = 0x00;
     
     // Create character device
     result = alloc_chrdev_region(&dev->dev_num, 0, 1, "supercamera");
