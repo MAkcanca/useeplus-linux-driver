@@ -22,6 +22,58 @@ The driver is implemented as a character device that:
 4. Processes the proprietary packet format to extract JPEG images
 5. Makes the image data available to userspace via a /dev/supercamera device
 
+The driver also registers a V4L2 capture node (`/dev/videoN`). It exposes the
+camera's 640x480 images as MJPEG, assembling each frame from the JPEG SOI/EOI
+markers in the USB payload. The original `/dev/supercamera` character device
+remains available for the included `simple-test` utility.
+
+## V4L2 testing
+
+After loading the module, find the assigned node and format with:
+
+```sh
+v4l2-ctl --list-devices
+v4l2-ctl -d /dev/videoN --list-formats-ext
+```
+
+The V4L2 node supports MMAP streaming and read I/O. Frames larger than 64 KiB
+are discarded by the current parser.
+
+To preview the camera with GStreamer, replace `/dev/videoN` with the node found
+above:
+
+```sh
+gst-launch-1.0 v4l2src device=/dev/videoN ! \
+    image/jpeg,width=640,height=480 ! jpegdec ! videoconvert ! autovideosink
+```
+
+On the tested system, `guvcview` displays the camera successfully. Cheese detects
+and lists it but fails to start the preview with a buffer negotiation error.
+
+## Installing and signing
+
+On Ubuntu systems with the standard shim MOK files, `sudo make install` installs
+a freshly built module after signing a temporary copy with
+`/var/lib/shim-signed/mok/MOK.priv` and `MOK.der`, then refreshes the module
+dependency map. Missing credentials or signing failures leave the installed
+module untouched. The destination kernel version comes from `KERNELDIR`;
+`INSTALL_MOD_PATH` supports staged installation. To use another private key and
+certificate pair, pass their paths to make:
+
+```sh
+sudo make install \
+    MOK_KEY=/path/to/enrolled-MOK.priv \
+    MOK_CERT=/path/to/enrolled-MOK.der
+```
+
+The certificate must be enrolled as a Machine Owner Key (MOK) on this machine
+and accepted in the shim's MOK Manager during boot. Enroll a certificate with
+`sudo mokutil --import /path/to/enrolled-MOK.der`, reboot, then complete the
+enrollment in MOK Manager. The private key and certificate must be a matching
+pair. Keep the private key readable by the `make install` signing step and
+protected from other users. If the module was already installed, rerunning
+`make install` replaces it with the newly signed copy.
+
 ## Key Data Structures
 
 ```c
@@ -207,9 +259,9 @@ Key features:
 
 ## Further Improvements
 
-1. **V4L2 Integration**: Implementing the Video4Linux2 API would provide better compatibility with existing applications.
+1. **V4L2 Compatibility**: Investigate the buffer negotiation failure observed with Cheese.
 
-2. **Direct JPEG Extraction**: The driver could extract individual JPEG images directly rather than passing raw data to userspace.
+2. **Larger JPEG Frames**: Extend the V4L2 parser beyond its current 64 KiB frame limit.
 
 3. **Camera Control**: Adding ioctls to control camera parameters like resolution, frame rate, etc.
 
