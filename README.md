@@ -27,6 +27,8 @@ camera's 640x480 images as MJPEG, assembling each frame from the JPEG SOI/EOI
 markers in the USB payload. The original `/dev/supercamera` character device
 remains available for the included `simple-test` utility.
 
+## V4L2 testing
+
 After loading the module, find the assigned node and format with:
 
 ```sh
@@ -48,10 +50,26 @@ gst-launch-1.0 v4l2src device=/dev/videoN ! \
 On the tested system, `guvcview` displays the camera successfully. Cheese detects
 and lists it but fails to start the preview with a buffer negotiation error.
 
+## Installing and signing
+
 On Ubuntu systems with the standard shim MOK files, `sudo make install` installs
 the module, signs it with `/var/lib/shim-signed/mok/MOK.priv` and `MOK.der`,
-then refreshes the module dependency map. Override `MOK_KEY` and `MOK_CERT` on
-the make command line if the enrolled key is stored elsewhere.
+then refreshes the module dependency map. To use another private key and
+certificate pair, pass their paths to make:
+
+```sh
+sudo make install \
+    MOK_KEY=/path/to/enrolled-MOK.priv \
+    MOK_CERT=/path/to/enrolled-MOK.der
+```
+
+The certificate must be enrolled as a Machine Owner Key (MOK) on this machine
+and accepted in the shim's MOK Manager during boot. Enroll a certificate with
+`sudo mokutil --import /path/to/enrolled-MOK.der`, reboot, then complete the
+enrollment in MOK Manager. The private key and certificate must be a matching
+pair. Keep the private key readable by the `make install` signing step and
+protected from other users. If the module was already installed, rerunning
+`make install` replaces it with the newly signed copy.
 
 ## Key Data Structures
 
