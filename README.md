@@ -22,6 +22,27 @@ The driver is implemented as a character device that:
 4. Processes the proprietary packet format to extract JPEG images
 5. Makes the image data available to userspace via a /dev/supercamera device
 
+The driver also registers a V4L2 capture node (`/dev/videoN`). It exposes the
+camera's 640x480 images as MJPEG, assembling each frame from the JPEG SOI/EOI
+markers in the USB payload. The original `/dev/supercamera` character device
+remains available for the included `simple-test` utility.
+
+After loading the module, find the assigned node and format with:
+
+```sh
+v4l2-ctl --list-devices
+v4l2-ctl -d /dev/videoN --list-formats-ext
+```
+
+Select that `/dev/videoN` node in OBS, Cheese, or another V4L2 camera app.
+The V4L2 node supports MMAP streaming and read I/O. Frames larger than 64 KiB
+are discarded by the current parser.
+
+On Ubuntu systems with the standard shim MOK files, `sudo make install` installs
+the module, signs it with `/var/lib/shim-signed/mok/MOK.priv` and `MOK.der`,
+then refreshes the module dependency map. Override `MOK_KEY` and `MOK_CERT` on
+the make command line if the enrolled key is stored elsewhere.
+
 ## Key Data Structures
 
 ```c
