@@ -53,8 +53,11 @@ and lists it but fails to start the preview with a buffer negotiation error.
 ## Installing and signing
 
 On Ubuntu systems with the standard shim MOK files, `sudo make install` installs
-the module, signs it with `/var/lib/shim-signed/mok/MOK.priv` and `MOK.der`,
-then refreshes the module dependency map. To use another private key and
+a freshly built module after signing a temporary copy with
+`/var/lib/shim-signed/mok/MOK.priv` and `MOK.der`, then refreshes the module
+dependency map. Missing credentials or signing failures leave the installed
+module untouched. The destination kernel version comes from `KERNELDIR`;
+`INSTALL_MOD_PATH` supports staged installation. To use another private key and
 certificate pair, pass their paths to make:
 
 ```sh
@@ -256,9 +259,9 @@ Key features:
 
 ## Further Improvements
 
-1. **V4L2 Integration**: Implementing the Video4Linux2 API would provide better compatibility with existing applications.
+1. **V4L2 Compatibility**: Investigate the buffer negotiation failure observed with Cheese.
 
-2. **Direct JPEG Extraction**: The driver could extract individual JPEG images directly rather than passing raw data to userspace.
+2. **Larger JPEG Frames**: Extend the V4L2 parser beyond its current 64 KiB frame limit.
 
 3. **Camera Control**: Adding ioctls to control camera parameters like resolution, frame rate, etc.
 

@@ -96,7 +96,6 @@ static int camera_release(struct inode *inode, struct file *file);
 static ssize_t camera_read(struct file *file, char __user *buf, size_t count, loff_t *pos);
 static void camera_device_release(struct kref *refcount);
 static int camera_v4l2_open(struct file *file);
-static int camera_v4l2_release(struct file *file);
 
 static struct file_operations camera_fops = {
     .owner = THIS_MODULE,
@@ -159,8 +158,10 @@ static int camera_vb2_start_streaming(struct vb2_queue *queue,
 
     spin_lock_irqsave(&dev->vb2_lock, flags);
     empty = list_empty(&dev->vb2_buffers);
-    if (!empty)
+    if (!empty) {
+        dev->sequence = 0;
         dev->v4l2_streaming = true;
+    }
     spin_unlock_irqrestore(&dev->vb2_lock, flags);
     pr_info("Camera: V4L2 stream start, queued buffers=%u\n", count);
     return empty ? -ENOBUFS : 0;
@@ -334,7 +335,7 @@ static const struct v4l2_ioctl_ops camera_ioctl_ops = {
 static const struct v4l2_file_operations camera_v4l2_fops = {
     .owner = THIS_MODULE,
     .open = camera_v4l2_open,
-    .release = camera_v4l2_release,
+    .release = vb2_fop_release,
     .read = vb2_fop_read,
     .poll = vb2_fop_poll,
     .unlocked_ioctl = video_ioctl2,
@@ -423,6 +424,14 @@ static void camera_process_jpeg(struct camera_dev *dev,
     }
 }
 
+static void camera_video_release(struct video_device *vdev)
+{
+    struct camera_dev *dev = video_get_drvdata(vdev);
+
+    video_device_release(vdev);
+    kref_put(&dev->refcount, camera_device_release);
+}
+
 static int camera_register_v4l2(struct camera_dev *dev)
 {
     struct vb2_queue *queue = &dev->vb2_queue;
@@ -461,14 +470,18 @@ static int camera_register_v4l2(struct camera_dev *dev)
     dev->vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE |
                              V4L2_CAP_STREAMING |
                              V4L2_CAP_READWRITE;
-    dev->vdev->release = video_device_release;
+    dev->vdev->release = camera_video_release;
     dev->vdev->lock = &dev->v4l2_lock;
     dev->vdev->queue = queue;
     video_set_drvdata(dev->vdev, dev);
 
+    /* Keep the queue and v4l2_device alive through the core's final release,
+     * including opens racing with unregister and failed opens.
+     */
+    kref_get(&dev->refcount);
     result = video_register_device(dev->vdev, VFL_TYPE_VIDEO, -1);
     if (result) {
-        video_device_release(dev->vdev);
+        camera_video_release(dev->vdev);
         dev->vdev = NULL;
         goto error_v4l2_device;
     }
@@ -512,24 +525,10 @@ static void camera_device_release(struct kref *refcount)
 static int camera_v4l2_open(struct file *file)
 {
     struct camera_dev *dev = video_drvdata(file);
-    int result;
 
     if (READ_ONCE(dev->disconnected))
         return -ENODEV;
-    kref_get(&dev->refcount);
-    result = v4l2_fh_open(file);
-    if (result)
-        kref_put(&dev->refcount, camera_device_release);
-    return result;
-}
-
-static int camera_v4l2_release(struct file *file)
-{
-    struct camera_dev *dev = video_drvdata(file);
-    int result = vb2_fop_release(file);
-
-    kref_put(&dev->refcount, camera_device_release);
-    return result;
+    return v4l2_fh_open(file);
 }
 
 // Process received data by adding it to the current frame
@@ -961,6 +960,8 @@ static int camera_probe(struct usb_interface *interface, const struct usb_device
     dev->interface = interface;
     dev->streaming = false;
     dev->device_open = false;
+    /* Published nodes must not accept opens until probe has succeeded. */
+    dev->disconnected = true;
     kref_init(&dev->refcount);
     mutex_init(&dev->io_mutex);
     mutex_init(&dev->v4l2_lock);
@@ -1037,6 +1038,9 @@ static int camera_probe(struct usb_interface *interface, const struct usb_device
     
     // Store device in interface
     usb_set_intfdata(interface, dev);
+    mutex_lock(&dev->io_mutex);
+    WRITE_ONCE(dev->disconnected, false);
+    mutex_unlock(&dev->io_mutex);
     
     printk(KERN_INFO "Camera: Device connected (/dev/supercamera)");
     return 0;
@@ -1052,9 +1056,7 @@ error_class_create:
 error_cdev_add:
     unregister_chrdev_region(dev->dev_num, 1);
 error_alloc_chrdev:
-    usb_put_dev(dev->udev);
-    kfree(dev->jpeg_data);
-    kfree(dev);
+    kref_put(&dev->refcount, camera_device_release);
     return result;
 }
 
