@@ -34,9 +34,19 @@ v4l2-ctl --list-devices
 v4l2-ctl -d /dev/videoN --list-formats-ext
 ```
 
-Select that `/dev/videoN` node in OBS, Cheese, or another V4L2 camera app.
 The V4L2 node supports MMAP streaming and read I/O. Frames larger than 64 KiB
 are discarded by the current parser.
+
+To preview the camera with GStreamer, replace `/dev/videoN` with the node found
+above:
+
+```sh
+gst-launch-1.0 v4l2src device=/dev/videoN ! \
+    image/jpeg,width=640,height=480 ! jpegdec ! videoconvert ! autovideosink
+```
+
+On the tested system, `guvcview` displays the camera successfully. Cheese detects
+and lists it but fails to start the preview with a buffer negotiation error.
 
 On Ubuntu systems with the standard shim MOK files, `sudo make install` installs
 the module, signs it with `/var/lib/shim-signed/mok/MOK.priv` and `MOK.der`,
